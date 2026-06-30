@@ -1,0 +1,461 @@
+超市智能导购车 下位机技术文档
+================================
+
+一、项目概述
+--------------------------------
+
+项目名称: 超市智能导购车
+我的分工: 下位机 (STM32F411CEU6 嵌入式端)
+  上位机和服务端由其他同学负责
+
+系统三层架构:
+  服务端  --WiFi/网络-->  上位机  --UART-->  下位机(我)
+  (商品DB+Web)          (LVGL界面)            (UWB定位+底盘+雷达+导航)
+
+下位机职责:
+  1. 接收上位机发来的目标坐标 (x, y) — 上位机自行处理商品→坐标
+  2. UWB 定位模块自己解算自身坐标
+  3. 编码器航迹推算 + UWB修正 = 当前位姿
+  4. 根据目标坐标和当前位姿，计算速度(v,w)，导航到目标
+  5. 两轮 PID 差速控制底盘
+  6. LD06 激光雷达避障
+
+
+二、芯片和外设选型
+--------------------------------
+
+  主控:      STM32F411CEU6 (Cortex-M4, 100MHz, 512KB Flash, 128KB SRAM)
+  激光雷达:  LD06_LD (乐动机器人, 0.02~12m, UART 230400bps)
+  UWB 定位:  MK8000 (USART1, 230400bps, 单字节IT中断)
+  电机驱动:  TB6612 双H桥
+  编码器:    霍尔编码器 (电机自带, 11PPR, 90:1减速比, 轮径67.5mm)
+  通信:      UART串口与上位机通信 (USART6, 115200bps)
+  工具链:    Keil MDK-ARM V5.32 + CubeMX 6.17
+  HAL库:     STM32Cube FW_F4 V1.28.3
+
+
+三、引脚分配 (最终版 2026-06-18)
+--------------------------------
+
+  PA0    LEFT_A     左编码器A         TIM2_CH1       AF1
+  PA1    LEFT_B     左编码器B         TIM2_CH2       AF1
+  PA2    LIDAR_TX   雷达串口发        USART2_TX      AF7
+  PA3    LIDAR_RX   雷达串口收        USART2_RX      AF7   230400bps
+  PA4    空闲        备用
+  PA5    空闲        备用
+  PA6    RIGHT_A    右编码器A         TIM3_CH1       AF2
+  PA7    RIGHT_B    右编码器B         TIM3_CH2       AF2
+  PA8    PWMA       左轮PWM           TIM1_CH1       AF1   20kHz
+  PA9    PWMB       右轮PWM           TIM1_CH2       AF1   20kHz
+  PA10   UWB_RX     UWB定位串口收     USART1_RX      AF7   230400bps
+  PA11   HOST_TX    上位机串口发      USART6_TX      AF8   115200bps
+  PA12   HOST_RX    上位机串口收      USART6_RX      AF8   115200bps
+  PA13   SWDIO      调试烧录          SYS            ---   固定
+  PA14   SWCLK      调试时钟          SYS            ---   固定
+  PA15   UWB_TX     UWB定位串口发     USART1_TX      AF7   230400bps
+  PB3    (JTDO)     保留不用
+  PB6    MPU_SCL    MPU6050陀螺仪I2C  I2C1_SCL      AF4   400kHz
+  PB7    MPU_SDA    MPU6050陀螺仪I2C  I2C1_SDA      AF4   400kHz
+  PB8    LIDAR_PWM  雷达电机转速      TIM10_CH1      AF3   30kHz
+  PB9    空闲        备用
+  PB10   空闲        原LD06_PWM,冲突已修复
+  PB12   INA1       左电机方向        GPIO_Output    ---
+  PB13   INA2       左电机方向        GPIO_Output    ---
+  PB14   INB1       右电机方向        GPIO_Output    ---
+  PB15   INB2       右电机方向        GPIO_Output    ---
+  PC6    空闲        原IMU_TX，已移到PA15
+  PC7    空闲        备用
+  PC13   LED        板载LED           GPIO_Output    ---  高电平亮
+
+空闲引脚(可用扩展): PA4, PA5, PB9, PB10, PC6, PC7
+保留不用:           PB3 (JTDO)
+
+
+四、定时器资源配置
+--------------------------------
+
+  TIM1    电机PWM        PSC=0, ARR=4999  -> 20kHz
+          CH1: PA8(左轮)  CH2: PA9(右轮)
+
+  TIM2    左轮编码器      编码器模式 TI12, 32位, 4倍频
+          CH1: PA0        CH2: PA1
+
+  TIM3    右轮编码器      编码器模式 TI12, 16位, 4倍频
+          CH1: PA6        CH2: PA7
+
+  TIM4    控制周期         PSC=99, ARR=9999 -> 100Hz (10ms)
+          内部时基, 触发Update中断
+
+  TIM10   雷达电机PWM      PSC=0, ARR=3332 -> 30kHz
+          CH1: PB8
+
+  SysTick HAL时基         1ms (CubeMX默认)
+
+
+五、串口资源配置
+--------------------------------
+
+  USART1    UWB定位         PA15->PA10    230400   单字节IT接收        已开中断
+  USART2    LD06雷达        PA2->PA3      230400   DMA1_S5_C4 循环      IDLE中断(帧检测)
+  USART6    上位机通信      PA11->PA12    115200   单字节IT接收
+
+
+六、中断优先级 (NVIC Group 4, 0最高)
+--------------------------------
+
+  1    DMA1_Stream5   LD06雷达 DMA 接收          (数据不能丢)
+  2    TIM4           100Hz主循环(编码器+PID+导航)
+  2    USART2         LD06雷达 IDLE 帧检测
+  5    USART1         UWB 单字节中断
+  5    USART6         上位机命令接收
+  15   SysTick        HAL 1ms 时基
+
+
+七、时钟树
+--------------------------------
+
+  HSE 25MHz (外部晶振)
+    -> PLL: /PLLM(25) -> 1MHz
+    -> PLL: xPLLN(200) -> VCO 200MHz
+    -> PLL: /PLLP(2) -> SYSCLK 100MHz
+
+  HCLK  = 100MHz
+  APB1  = 50MHz  -> APB1 Timer Clock = 100MHz (自动x2)
+  APB2  = 100MHz -> APB2 Timer Clock = 100MHz
+
+
+八、上位机通信协议 (USART6)
+--------------------------------
+
+  帧格式: [0xA5] [CMD] [LEN] [载荷LEN字节] [XOR校验]
+  XOR校验 = CMD ^ LEN ^ 载荷逐字节异或
+
+  指令:
+    0x01  载荷8B    上位机发目标坐标
+            前4B: x (int32, 小端, 单位mm)
+            后4B: y (int32, 小端, 单位mm)
+            纯路径模式: 起点固定(0,0) → Path_Plan(0,0,x,y) → 逐条回传 0x90
+            完整模式:      Navi_SetTarget(x,y) → 开始导航 + PID底盘
+
+    0x02  载荷0B    急停 (仅 DEBUG_ENABLE_NAVI=1 时有效)
+
+    0x04  载荷2B    开环测试 (仅 DEBUG_ENABLE_MOTOR=1 时有效)
+            前1B: 左轮占空比% (uint8, 0~100)
+            后1B: 右轮占空比% (uint8, 0~100)
+
+    0x05  载荷8B    设定锚点世界坐标 (仅 DEBUG_ENABLE_COORD_SOLVER=1 时有效)
+            前2B: ax, 再2B: ay, 再2B: bx, 再2B: by (int16*4, mm)
+
+    0x80  载荷10B   下位机回复当前位姿(每2000ms自动上报)
+            前4B: x (int32, 小端, 单位mm)
+            中4B: y (int32, 小端, 单位mm)
+            后2B: yaw (int16, 小端, 单位0.01度)
+
+    0x90  载荷10B   下位机回复路点 (响应 0x01 目标/ASCII输入)
+            前1B: 路点序号 (0-based)
+            再1B: 总路点数
+            再4B: x (int32, 小端, 单位mm)
+            再4B: y (int32, 小端, 单位mm)
+            上位机收齐 total 条即完成规划
+
+  已删除指令(06-26): 0x06(商品目标)/0x07(地图查询)/0x81(商品回复)/0x82(地图信息)
+  → 上位机自行处理商品→坐标映射, 直接发 0x01 目标坐标即可
+
+  举例-上位机发送目标点 (300mm, 400mm):
+    十六进制: A5 01 08 2C 01 00 00 90 01 00 00 B5
+    校验: 01 ^ 08 ^ 2C ^ 01 ^ 00 ^ 00 ^ 90 ^ 01 ^ 00 ^ 00 = B5
+
+  举例-开环50%占空比测试:
+    十六进制: A5 04 02 32 32 06
+    校验: 04 ^ 02 ^ 32 ^ 32 = 06
+
+  举例-急停:
+    十六进制: A5 02 00 02
+    校验: 02 ^ 00 = 02
+
+
+
+九、导航控制策略
+--------------------------------
+
+  输入: Navi_SetTarget(x, y) 设目标坐标
+  当前位姿来源:
+    主: UWB实时定位提供(x,y)绝对坐标, 无累积漂移
+    **yaw: MPU6050陀螺仪 Gz积分** (不依赖编码器差速)
+        兜底: UWB掉线时编码器短期接管(x,y)位置推算
+
+  控制律 (P控制, 每10ms):
+    1. dx = 目标x - 当前x
+    2. dy = 目标y - 当前y
+    3. 距离 dist = sqrt(dx^2 + dy^2)
+    4. 目标朝向 desired_yaw = atan2(dy, dx)
+    5. 角度误差 err = norm(desired_yaw - 当前yaw)  范围(-PI,PI)
+    6. v = NAVI_K_DIST * dist,  限幅到 MAX_SPEED
+    7. w = NAVI_K_ANGLE * err,  限幅到 MAX_OMEGA
+    8. 大角度偏差(>57度)时 v *= 0.3 (先转后走)
+    9. Chassis_SetTarget(v, w)
+    10. dist < 500mm 判定到达, 自动停车
+
+  可调参数:
+    NAVI_ARRIVE_MM        = 500   到达判定距离(mm) — 格级导航容差
+    NAVI_MAX_SPEED_MM_S   = 300   最大线速度(mm/s)
+    NAVI_MAX_OMEGA        = 0.6   最大角速度(rad/s) — 防UWB噪声放大
+    NAVI_K_DIST           = 0.5   距离->速度 P系数 — 略增克服起步停滞
+    NAVI_K_ANGLE          = 0.6   角度差->角速度 P系数 — 降低防摆动
+    NAVI_ANGLE_EMA_ALPHA  = 0.15  角度误差EMA α — 滤除UWB跳变
+    NAVI_SLOW_ANGLE_THRESH= 1.5   超过86°才减速 (防UWB噪声频繁误触发)
+
+
+十、底盘控制策略
+--------------------------------
+
+  PID速度闭环 (v,w):
+    目标(v,w) -> 逆运动学 -> 左轮速目标/右轮速目标
+    编码器读轮速 -> PID(左) / PID(右) -> PWM占空比 -> TB6612电机
+
+  可调参数:
+    WHEEL_SPEED_MAX_MM_S = 500    最大轮速
+    SPEED_KP             = 20.0   速度环P
+    SPEED_KI             = 5.0    速度环I (防积分饱和振荡)
+    SPEED_KD             = 1.5    速度环D
+    LEFT_WHEEL_TRIM       = 1.02   左轮平衡补偿 (165vs182)
+
+  车辆物理参数:
+    编码器PPR: 11, 减速比: 90:1, 轮径: 67.5mm, 轮距: 150mm
+
+
+十一、软件模块清单
+--------------------------------
+
+  BSP/ (板级驱动) -- 8个模块
+    debug_config.h  模块调试开关 (独立启停各功能, 编译期 #if)
+    bsp_motor       TB6612 电机方向+速度
+    bsp_encoder     霍尔编码器 RPM+里程
+    bsp_lidar       LD06 激光雷达 点云
+    bsp_uwb         MK8000 UWB 定位坐标
+    bsp_uart        上位机通信协议 (二进制+ASCII双模)
+    bsp_callbacks   中断->业务 + GyroHold 航向锁
+      mpu6050        MPU6050 陀螺仪 PB6/PB7 I2C1
+
+  APP/ (应用层) -- 6个模块
+    pid             位置式PID (抗积分饱和+输出限幅)
+    kinematics      差速运动学 正解/逆解
+    chassis_task    底盘速度闭环
+    navi_task       导航调度 (UWB+里程+路点跟随)
+    app_init        统一初始化入口
+
+
+十二A、UWB定位 (2026-06-28 重写)
+--------------------------------
+
+  算法: trilat2D_3A 线性最小二乘 (移植自 Arduino ESP32_UWB_tag2D_3A)
+    三锚全在线 → trilat2D_3A
+    C离线      → AB三角回退
+    A离线      → BC三角回退
+
+  trilat2D_3A 特性:
+    - 自动选最近锚作参考 → d[0]²最小 → 误差传播最小
+    - 近A时A作参考, 近B时B作参考 → 避免固定参考锚远距误差放大
+    - A矩阵仅依赖锚点坐标, 开机算一次 (静态变量)
+
+  锚点配置 (06-28最终):
+    UWB局部系: A(8.88,0)  B(0.2,0)  C(9.66,8.93)
+    世界系:     A(8880,0)  B(0,0)    C(9660,8930)
+    物理模块:   A=0x0002   B=0x0001  C=0x0003
+
+  高度 (06-28实测修正):
+    标签=0.52m  锚点=1.90m (三锚等高) → dz=1.38m
+
+  天线延迟 (运行时变量, USART6串口实时可调):
+    A = 0.50m   B = 1.40m   C = 0.00m
+
+  数据有效性门限:
+    锚点超时: 500ms无新数据 → 定位无效
+    RSSI最低: 30 (过低丢弃)
+    斜距<0.2m或>30m丢弃
+
+  滤波: 斜距EMA α=0.15 (每锚独立)
+
+  printf格式 (每1s):
+    X=%.2f Y=%.2f eA=%.2f eB=%.2f eC=%.2f Q=%d A=%c B=%c C=%c R=%.3f d=%.2f/%.2f/%.2f
+
+  串口实时调延 (USART6 ASCII):
+    A0.5 回车 → 设A延迟0.50m
+    B1.4 回车 → 设B延迟1.40m
+    ? 回车   → 查看当前延迟值
+
+
+十二B、坐标解算器 (2026-06-20, B原点)
+--------------------------------
+
+  目标: UWB局部坐标 → 超市世界坐标 (B=(0,0), +X=西, +Y=北)
+
+  变换步骤:
+    1. 计算AB连线在世界系中的方向角 θ = atan2(By-Ay, Bx-Ax)
+    2. 旋转: X' = xL·cosθ - yL·sinθ,  Y' = xL·sinθ + yL·cosθ
+    3. 平移: Xw = Ax + X',  Yw = Ay + Y'
+
+  锚点世界坐标: 由上位机CMD 0x05下发 (int16×4, mm)
+  UWB局部间距: UWB_ANCHOR_SPACING_M = 8.88m (用户实测)
+
+
+十二C、超市地图 (2026-06-20, 改 06-26)
+--------------------------------
+
+  地图规格:
+    类型: 硬编码静态栅格占据地图 (Map_LoadDefault)
+    尺寸: 9660mm×8930mm (780主过道+8880货架区), 100×95格
+    分辨率: 100mm/格
+    内存: ~11KB (格9.5KB+障碍1.2KB+过道0.4KB)
+    数据来源: Excel实测标注 (2026-06-20)
+
+  格值: 0=FREE 1=OBSTACLE 2=AISLE 3=CHECKOUT 4=SHELF 5=WALL
+
+  障碍物:
+    墙壁: 4面 (南/北/东/西, 厚100mm)
+    货架: 3块通栏矩形 (列间无缝隙, 物理不可通行)
+      货架B (南): X=100~8880 Y=1900~3360 (过道1和过道2之间)
+      货架A (中): X=100~8880 Y=5050~6510 (过道2和过道3之间)
+      北货架:      X=100~8880 Y=8200~8830 (过道3上方)
+
+  过道:
+    过道1 (南): Y=100~1900 (190cm)
+    过道2 (中): Y=3360~5050 (169cm)
+    过道3 (北): Y=6510~8200 (169cm)
+    主过道:      X=8880~9560 (78cm) — 唯一南北通道
+
+  已删除 (06-26): 商品坐标表 — 上位机自行处理商品→坐标映射
+
+
+十二D、路径规划 (2026-06-20, 改 06-26)
+--------------------------------
+
+  算法: 过道路点图 + A* 搜索
+    路点图: 3行×9列=27节点 (梳子型拓扑)
+    水平层 Y = 985, 4230, 7380 (过道中线)
+    垂直列 X = 600, 1110, 2220, 3330, 4440, 5550, 6660, 8800, 9270
+
+  拓扑约束 (06-26修正):
+    仅主过道(col8, X=9270)可南北穿行
+    货架区 col1~col7 列间无缝隙, 禁止垂直连接
+    → 路径必须: 水平到主过道 → 换层 → 再水平, 不穿货架
+
+  A* 搜索 + 路径共线去除
+  内存: <2KB
+
+
+十二E、项目进度 (截至 2026-06-28)
+--------------------------------
+
+  [已完成]
+    ✅ 1-4    LED/串口/电机编码器/UWB基础 (06-18)
+    ✅ 5-7    三锚GN+高度修正/坐标解算/超市地图 (06-20)
+    ✅ 8-10   协议扩展/ASCII输入/A*路径规划 (06-20)
+    ✅ 11-13  调试开关/Bug修复/死代码清理 (06-25)
+    ✅ 14-15  主动刹车/PID闭环(20/40/1.5) (06-26)
+    ✅ 16-17  雷达DMA+CRC/完整圈过滤 (06-26)
+    ✅ 18.    地图模型修正 — 商品表删除, 拓扑梳子化, 协议精简 (06-26)
+    ✅ 19.    UWB定位重写 — trilat2D_3A线性最小二乘, 自动近锚参考 (06-28)
+    ✅ 20.    锚点ID+坐标确认 — A=0x0002(西南) B=0x0001(东南,B=0.2,0) C=0x0003(西北) (06-28)
+    ✅ 21.    天线延迟标定 — A=0.50 B=1.40 C=0.00, 运行时变量+串口实时调参 (06-28)
+    ✅ 22.    标签高度修正 — 0.10→0.52m, dz=1.38m (06-28)
+
+  [待调试] (下一步)
+    🔜 23. PID 整定校准 — LEFT_WHEEL_TRIM 精确值, 标定 duty→mm/s 曲线
+    🔜 24. 导航联调 — UWB全开 + PID底盘 + 路点跟随, 端到端走通
+    ⬜ 25. 激光雷达避障 — 点云→障碍物检测 → 导航绕行
+
+
+十二F、模块调试开关系统 (2026-06-25)
+--------------------------------
+
+  BSP\Inc\debug_config.h — 12个独立编译期开关
+
+  每个功能模块独立编译期开关 (1=启用, 0=禁用):
+    DEBUG_ENABLE_LED           LED心跳闪烁 (0.5s)
+    DEBUG_ENABLE_UWB           UWB MK8000 三锚定位
+    DEBUG_ENABLE_ENCODER       霍尔编码器 轮速+里程
+    DEBUG_ENABLE_MOTOR         TB6612 PWM输出
+    DEBUG_ENABLE_PID           速度环PID闭环
+    DEBUG_ENABLE_NAVI          导航调度 (UWB+路点跟随→v,w)
+    DEBUG_ENABLE_LIDAR         LD06点云采集
+    DEBUG_ENABLE_HOST_UART     USART6协议+ASCII双模
+    DEBUG_ENABLE_PATH_PLAN     A*路径规划 (27节点梳子图)
+    DEBUG_ENABLE_COORD_SOLVER  坐标解算 (UWB局部→世界)
+    DEBUG_ENABLE_MAP           超市栅格地图
+    DEBUG_ENABLE_MOTOR_TEST    电机自检 (上电左右轮交替+直线)
+
+  组合宏:
+    DEBUG_CHASSIS_READY = ENCODER && MOTOR && PID
+    DEBUG_NAVI_READY    = UWB && COORD_SOLVER && CHASSIS_READY && NAVI
+
+  当前默认: LED=1, UWB=1, HOST_UART=1, 其余=0 (UWB纯定位测试)
+
+
+十三、调试方法速查
+--------------------------------
+
+上电检查:
+  板载PC13 LED 以1Hz闪烁 = 晶振+PLL+SysTick+TIM4 全部正常
+
+ASCII 路径规划测试:
+  1. debug_config.h: PATH_PLAN=1, UWB=1, HOST_UART=1, 其余关
+  2. 串口助手连接 PA11/PA12, 115200 8N1
+  3. 输入 "5 4" 回车 → 自动规划并回传路点 (单位m)
+
+串口协议测试 (USART6, 115200 8N1):
+  发送目标: A5 01 08 2C 01 00 00 90 01 00 00 B5  → 导航开始
+  发送开环: A5 04 02 32 32 06  → 两轮50%占空比
+  发送急停: A5 02 00 02
+
+电机测试 (TB6612接线):
+  PA8/PA9 = PWM 20kHz
+  PB12-PB15 = TB6612 INA1/INA2/INB1/INB2 (左电机 INA1↔INA2 反接)
+  STBY = 3.3V (必须! 不然不转)
+  VMOT = 7~12V 独立电源
+
+编码器测试 (霍尔, TIM2/TIM3 编码器模式):
+  编码器A/B接PA0/PA1(左) PA6/PA7(右), VCC/GND独立供电
+  串口看轮速帧: 50%占空比 → ~150~180mm/s
+  左编码器已翻转(ENCODER_LEFT_INVERT=1, 匹配INA反接)
+
+UWB测试 (MK8000, USART1 230400):
+  标签TX→PA10, GND→GND, VCC→3.3V/5V
+  单测UWB: UWB=1, LED=1, HOST_UART=1, 其余=0
+  帧格式: [F0][05][addrL][addrH][distL(cm)][distH][rssi][AA]
+  锚A=0x0002(西南) B=0x0001(东南) C=0x0003(西北)
+  定位: trilat2D_3A 线性最小二乘(自动近锚参考) + AB/BC回退
+  锚间距: AB=8.68m, 标签0.52m 锚1.90m → dz=1.38m
+
+雷达测试 (LD06, USART2 230400):
+  硬件: PA2→LD06_RX, PA3→LD06_TX, PB8→电机PWM(30kHz 50%)
+  供电: 雷达独立5V
+  上电后听电机转声 → 2~3s初始化 → 串口输出 "#1800" 完整圈帧
+  数据格式: 角度(°),距离(cm),强度  (CSV, 每40点抽1, 仅≥1600点完整圈)
+  ⚠️ DMA+IDLE链路已验证
+  ⚠️ 雷达帧需过滤半圈残帧(count<1600丢弃), 整帧buf一次性HAL_UART_Transmit发送
+
+
+纯路径规划模式 (06-26 新增):
+  1. debug_config.h: LED=1, PATH_PLAN=1, HOST_UART=1, 其余=0
+  2. 上电无任何硬件需求 (电机/雷达/UWB全关), LED 1Hz心跳
+  3. 上位机发目标 (0x01, 8B) → Path_Plan(0,0,x,y) → 逐条回传 0x90 路点
+  4. 也可 ASCII 文本交互: 串口直输 "x y"(m) → 回传路点序列
+
+全功能自主导航模式 (06-26 新增):
+  1. debug_config.h: 开 LED/UWB/ENCODER/MOTOR/PID/NAVI/COORD/MAP/PATH/HOST
+  2. 上电流程:
+     App_Init → 设锚点(8880,0)-(0,0) → 3s等UWB稳定 → 目标(9270,4230)mm
+     → 2s等位姿收敛 → Chassis_PID_Enable(1) → 发车!
+  3. 小车自动: UWB定位 → yaw编码器 → 路径A*规划 → PID差速 → 路点跟随
+  4. 目标硬编码在 main.c: Navi_SetTarget(9270, 4230)  ← 主过道中央
+  5. 上位机可在行驶中发 0x01 覆盖目标, 发 0x02 急停
+  6. 所有模块受 #if DEBUG_xxx 守卫, 可随时降级回纯路径规划模式
+
+十四、工程路径
+--------------------------------
+工程根目录: Guide_Control\BaseControlSystem\
+CubeMX文件: BaseControlSystem.ioc
+Keil工程:   MDK-ARM\BaseControlSystem.uvprojx
+详细说明:   README.txt (函数+文件清单)
+技术文档:   本文档

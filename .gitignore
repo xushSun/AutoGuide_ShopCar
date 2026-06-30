@@ -1,0 +1,33 @@
+# Keil MDK build outputs
+*.uvguix.*
+*.uvoptx
+*.lst
+*.out
+*.hex
+*.bin
+*.axf
+*.htm
+*.lnp
+*.sct
+*.dep
+RTE/
+DebugConfig/
+JLinkLog.txt
+JLinkSettings.ini
+
+# CubeMX
+.mxproject/
+
+# Archive zips
+*.zip
+
+# Temp
+*.tmp
+*.bak
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
