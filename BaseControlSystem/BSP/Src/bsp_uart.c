@@ -89,9 +89,11 @@ static void host_dispatch(uint8_t cmd, const uint8_t *payload, uint8_t len)
             int16_t ay = (int16_t)(payload[2] | ((uint16_t)payload[3] << 8));
             int16_t bx = (int16_t)(payload[4] | ((uint16_t)payload[5] << 8));
             int16_t by = (int16_t)(payload[6] | ((uint16_t)payload[7] << 8));
-            CoordSolver_SetAnchors(ax, ay, bx, by,
-                                   UWB_A_X_M, UWB_A_Y_M,
-                                   UWB_B_X_M, UWB_B_Y_M);
+            /* C锚世界坐标固定, UWB实测值固定 */
+            CoordSolver_SetAnchors(ax, ay, bx, by, 9660, 8930,
+                                   8.85f, 0.00f,
+                                   -0.72f, 1.00f,
+                                   8.95f, 9.35f);
         }
         break;
 #endif
@@ -188,6 +190,9 @@ static void parse_ascii_number(void)
         #undef WI
         #undef W
         #undef T
+
+        /* 触发导航 (ASCII模式: 输入单位米, 转mm) */
+        Nav_SetTarget(text_tx * 1000, text_ty * 1000);
     } else {
         text_tx = v;
         text_need_y = 1;
@@ -206,8 +211,8 @@ void HostUART_Init(void)
 
 void HostUART_ParseByte(uint8_t byte)
 {
-    /* 非0xA5 → ASCII */
-    if (byte != HOST_HEADER) {
+    /* 空闲态 + 非帧头 → ASCII；正在收二进制帧时不干扰 */
+    if (rx_state == HOST_STATE_IDLE && byte != HOST_HEADER) {
         text_last_ms = HAL_GetTick();
         if (byte == ' ' || byte == '\r' || byte == '\n') {
             if (text_idx > 0) {

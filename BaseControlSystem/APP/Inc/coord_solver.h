@@ -1,9 +1,12 @@
 /**
  * @file    coord_solver.h
- * @brief   坐标解算器 — UWB局部坐标系 → 超市世界坐标系 (仿射变换)
+ * @brief   坐标解算器 — UWB局部坐标系 → 超市世界坐标系 (完整2D仿射变换)
  *
- * 已知两个锚点在UWB系和世界系中的坐标，求解仿射变换参数(sx, sy, tx, ty)。
- * UWB输出(xL, yL)单位米, 世界坐标单位mm。
+ * 用 A/B/C 三个锚点的实测 UWB 坐标做 6 参数仿射标定:
+ *   W_x = a*U_x + b*U_y + c
+ *   W_y = d*U_x + e*U_y + f
+ *
+ * 可处理 UWB 坐标系与世界坐标系之间的旋转+缩放+平移。
  */
 
 #ifndef __COORD_SOLVER_H__
@@ -28,12 +31,13 @@ typedef struct {
 typedef struct {
     WorldPoint_t anchor_A_world;
     WorldPoint_t anchor_B_world;
+    WorldPoint_t anchor_C_world;
     UWBPoint_t   anchor_A_uwb;
     UWBPoint_t   anchor_B_uwb;
-    float sx;                     /* X比例: (dw/dx_uwb) mm/m  */
-    float sy;                     /* Y比例: (dw/dy_uwb) mm/m  */
-    float tx;                     /* X平移 mm                 */
-    float ty;                     /* Y平移 mm                 */
+    UWBPoint_t   anchor_C_uwb;
+    /* 6 参数仿射: W = M * U + T */
+    float ax, bx, cx;   /* W_x = ax*U_x + bx*U_y + cx */
+    float ay, by, cy;   /* W_y = ay*U_x + by*U_y + cy */
     uint8_t configured;
 } CoordSolver_t;
 
@@ -42,19 +46,23 @@ typedef struct {
 void CoordSolver_Init(void);
 
 /**
- * @brief  设定锚点对 (UWB + 世界), 预计算仿射参数
- * @param  ax_mm, ay_mm : 锚点A世界坐标 (mm)
- * @param  bx_mm, by_mm : 锚点B世界坐标 (mm)
- * @param  a_uwb_x/y    : 锚点A在UWB局部系中的坐标 (m)
- * @param  b_uwb_x/y    : 锚点B在UWB局部系中的坐标 (m)
+ * @brief  设定三个锚点 (UWB实测 + 世界), 预计算6参数仿射
+ * @param  ax/ay_mm : 锚点A世界坐标 (mm)
+ * @param  bx/by_mm : 锚点B世界坐标 (mm)
+ * @param  cx/cy_mm : 锚点C世界坐标 (mm)
+ * @param  a_uwb_x/y: 锚点A实测UWB坐标 (m)
+ * @param  b_uwb_x/y: 锚点B实测UWB坐标 (m)
+ * @param  c_uwb_x/y: 锚点C实测UWB坐标 (m)
  */
 void CoordSolver_SetAnchors(int16_t ax_mm, int16_t ay_mm,
                             int16_t bx_mm, int16_t by_mm,
+                            int16_t cx_mm, int16_t cy_mm,
                             float a_uwb_x, float a_uwb_y,
-                            float b_uwb_x, float b_uwb_y);
+                            float b_uwb_x, float b_uwb_y,
+                            float c_uwb_x, float c_uwb_y);
 
 /**
- * @brief  UWB局部坐标 → 世界坐标 (仿射变换)
+ * @brief  UWB局部坐标 → 世界坐标 (6参数仿射)
  */
 void CoordSolver_Transform(float local_x_m, float local_y_m,
                            int32_t *world_x_mm, int32_t *world_y_mm);
