@@ -12,6 +12,7 @@
 #include "bsp_motor.h"
 #include "bsp_encoder.h"
 #include "kinematics.h"
+#include "bsp_callbacks.h"
 
 /* --------------------------------------------------------------------------
  *  模块内部状态
@@ -64,12 +65,17 @@ void Chassis_SetTarget(float v, float w)
 /* 急停：刹车 + PID积分清零 */
 void Chassis_EmergencyStop(void)
 {
-    Motor_Brake();
+    Motor_ActiveBrake(0, 35, 80);
     PID_Reset(&pid_left);
     PID_Reset(&pid_right);
     control_active = 0;
+    pid_enabled = 0;
     target_wheel.left  = 0.0f;
     target_wheel.right = 0.0f;
+    actual_body.v = 0.0f;
+    actual_body.w = 0.0f;
+    g_duty_L = 0;
+    g_duty_R = 0;
 }
 
 /* 10ms控制迭代（TIM4中断 → bsp_callbacks → 这里） */
@@ -85,6 +91,18 @@ void Chassis_ControlLoop(void)
     /* ② PID计算 → PWM占空比 */
     int16_t duty_left  = (int16_t)PID_Compute(&pid_left,  actual_wheel.left,  0.0f);
     int16_t duty_right = (int16_t)PID_Compute(&pid_right, actual_wheel.right, 0.0f);
+
+    /* 陀螺仪直行修正: 直接叠加占空比 */
+    int16_t gyro_corr = (int16_t)GyroHold_ComputeW();
+    duty_left  += gyro_corr;
+    duty_right -= gyro_corr;
+
+    /* 钳位 */
+    if (duty_left  >  MOTOR_PWM_MAX) duty_left  =  MOTOR_PWM_MAX;
+    if (duty_left  < -MOTOR_PWM_MAX) duty_left  = -MOTOR_PWM_MAX;
+    if (duty_right >  MOTOR_PWM_MAX) duty_right =  MOTOR_PWM_MAX;
+    if (duty_right < -MOTOR_PWM_MAX) duty_right = -MOTOR_PWM_MAX;
+
     g_duty_L = duty_left;
     g_duty_R = duty_right;
 
@@ -106,6 +124,7 @@ void Chassis_PID_Enable(uint8_t en)
 {
     pid_enabled = (en != 0) ? 1 : 0;
     if (en) control_active = 1;
+    else Chassis_EmergencyStop();
 }
 
 /* 运行时调节左轮平衡 (1.0=平衡, >1.0=左轮加速, <1.0=左轮减速) */

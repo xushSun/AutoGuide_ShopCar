@@ -1,5 +1,6 @@
 /*By 高过_Gaoguo*/
 #include <math.h>
+#include <stdio.h>
 #include "mpu6050.h"
 //弧度转角度1rad = 57.2958°
 #define RAD_TO_DEG 57.295779513082320876798154814105
@@ -65,6 +66,13 @@ uint8_t MPU6050_Init(I2C_HandleTypeDef *I2Cx)
         // XG_ST=0,YG_ST=0,ZG_ST=0, FS_SEL=0 -> � 250 �/s
         Data = 0x00;
         HAL_I2C_Mem_Write(I2Cx, MPU6050_ADDR, GYRO_CONFIG_REG, 1, &Data, 1, i2c_timeout);
+        /* 回读验证 GYRO_CONFIG 是否写入成功 */
+        {
+            uint8_t regval;
+            HAL_I2C_Mem_Read(I2Cx, MPU6050_ADDR, GYRO_CONFIG_REG, 1, &regval, 1, i2c_timeout);
+            if (regval != 0x00)
+                printf("GYRO_CONFIG=0x%02X (expect 0x00)\r\n", regval);
+        }
         return 0;
     }
     return 1;
@@ -161,7 +169,7 @@ void MPU6050_Read_All(I2C_HandleTypeDef *I2Cx, MPU6050_t *DataStruct)
     DataStruct->Temperature = (float)((int16_t)temp / (float)340.0 + (float)36.53);
     DataStruct->Gx = DataStruct->Gyro_X_RAW / 131.0;
     DataStruct->Gy = DataStruct->Gyro_Y_RAW / 131.0;
-    DataStruct->Gz = DataStruct->Gyro_Z_RAW / 131.0 - 4;
+    DataStruct->Gz = DataStruct->Gyro_Z_RAW / 131.0;
 
 		if(DataStruct->Gz > -0.4&&DataStruct->Gz < 0.4)
 			DataStruct->Gz = 0;
@@ -195,5 +203,4 @@ void MPU6050_Read_All(I2C_HandleTypeDef *I2Cx, MPU6050_t *DataStruct)
 		yaw_angle += DataStruct->Gz * dt;  // 角速度积分（rad/s × s = rad）
 		DataStruct->KalmanAngleZ = yaw_angle;
 }
-
 

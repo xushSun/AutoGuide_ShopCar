@@ -1,5 +1,6 @@
 /**
  * @file    navi_task.c
+ * @deprecated 此文件已废弃, 实际导航用 app_navigate.c, 已从编译列表移除
  * @brief   导航调度 — 目标坐标 + 位姿 -> 算 v,w -> 底盘速度闭环
  *
  * 数据流:

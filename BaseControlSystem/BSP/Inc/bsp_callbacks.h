@@ -22,6 +22,7 @@ void BSP_UART2_IDLE_Handler(void);
 
 /* 陀螺仪 yaw (rad/deg) — GyroHold_Update 积分, NAVI/直走共用 */
 void  Gyro_Enable(void);           /* MPU6050_Init 成功后调用 */
+void  GyroHold_Update(void);       /* 主循环调用, 陀螺仪 yaw 积分 (非 ISR) */
 void  GyroHold_Calibrate(void);    /* 上电静止2s采样 Gz 零偏, TIM4启动前调用 */
 float HLD_get_yaw_rad(void);
 float HLD_get_yaw_deg(void);

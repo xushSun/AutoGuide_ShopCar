@@ -35,6 +35,8 @@ typedef struct {
 /* -------------------------------------------------------------------------- */
 
 void Lidar_Init(void);
+void Lidar_Poll(void);
+void Lidar_MarkDataPending(void);
 void Lidar_ParseFrame(const uint8_t *buf, uint16_t len);
 const LidarPoint_t * Lidar_GetScan(uint16_t *count);
 void Lidar_MotorOn(void);

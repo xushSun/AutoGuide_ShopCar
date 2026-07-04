@@ -40,12 +40,12 @@ void App_Init(void)
 #if DEBUG_ENABLE_COORD_SOLVER
     /* 坐标解算器: 3锚实测UWB坐标 → 世界 6参数仿射
      * 世界: A=(8880,0)  B=(20,0)  C=(9660,8930) mm
-     * 实测: A=(8.85,0.00) B=(-0.72,1.00) C=(8.95,9.35) m */
+     * 实测: A=(8.93,0.17) B=(-0.83,0.00) C=(9.39,9.05) m */
     CoordSolver_Init();
     CoordSolver_SetAnchors(8880, 0, 20, 0, 9660, 8930,
-                           8.85f, 0.00f,
-                           -0.72f, 1.00f,
-                           8.95f, 9.35f);
+                           8.93f, 0.17f,
+                           -0.83f, 0.00f,
+                           9.39f, 9.05f);
 #endif
 
 #if DEBUG_ENABLE_MAP

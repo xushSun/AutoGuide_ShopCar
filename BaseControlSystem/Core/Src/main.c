@@ -109,7 +109,7 @@ int main(void)
     {
         static uint32_t last_imu = 0;
         uint32_t now = HAL_GetTick();
-        if ((uint32_t)(now - last_imu) >= 5) {
+        if ((uint32_t)(now - last_imu) >= 2) {
             last_imu = now;
             GyroHold_ReadIMU();
             GyroHold_Update();           /* 紧跟读取, 不跨 ISR 边界的 data race */
@@ -121,17 +121,24 @@ int main(void)
 #if DEBUG_ENABLE_LIDAR
     {
         static uint32_t last_lidar = 0;
+        static uint32_t last_lidar_ok = 0;
         uint32_t now = HAL_GetTick();
         if ((uint32_t)(now - last_lidar) >= 30) {
             last_lidar = now;
+            Lidar_Poll();
             uint16_t n;
             const LidarPoint_t *pts = Lidar_GetScan(&n);
-            g_lidar_turn_open = 0;
-            g_lidar_left_y    = 99.0f;
-            g_lidar_right_y   = 99.0f;
 
             if (pts && n >= 100) {
                 uint16_t right_zone_cnt = 0;
+                uint16_t front_cnt = 0;
+                uint16_t left_cnt  = 0;
+                uint16_t right_cnt = 0;
+                float front_m = 99.0f;
+                float left_m  = 99.0f;
+                float right_m = 99.0f;
+
+                last_lidar_ok = now;
 
                 for (uint16_t i = 0; i < n; i++) {
                     if (!pts[i].valid) continue;
@@ -140,10 +147,33 @@ int main(void)
                     if (pts[i].x > 0.50f && pts[i].x < 1.00f && pts[i].y < -0.15f) {
                         right_zone_cnt++;
                     }
+                    if (pts[i].x > 0.15f && pts[i].x < 0.90f &&
+                        pts[i].y > -0.30f && pts[i].y < 0.30f) {
+                        if (pts[i].x < front_m) front_m = pts[i].x;
+                        front_cnt++;
+                    }
+                    if (pts[i].x > 0.12f && pts[i].x < 0.70f &&
+                        pts[i].y > 0.18f && pts[i].y < 0.42f) {
+                        if (pts[i].dist < left_m) left_m = pts[i].dist;
+                        left_cnt++;
+                    }
+                    if (pts[i].x > 0.12f && pts[i].x < 0.70f &&
+                        pts[i].y < -0.18f && pts[i].y > -0.42f) {
+                        if (pts[i].dist < right_m) right_m = pts[i].dist;
+                        right_cnt++;
+                    }
                 }
 
                 /* 点数<5 → 右前方空旷 → 可转弯 */
                 g_lidar_turn_open = (right_zone_cnt < 5) ? 1 : 0;
+                g_lidar_front_m = (front_cnt >= 2) ? front_m : 99.0f;
+                g_lidar_left_m  = (left_cnt  >= 2) ? left_m  : 99.0f;
+                g_lidar_right_m = (right_cnt >= 2) ? right_m : 99.0f;
+            } else if ((uint32_t)(now - last_lidar_ok) > NAV_LIDAR_TIMEOUT_MS) {
+                g_lidar_turn_open = 0;
+                g_lidar_front_m   = 99.0f;
+                g_lidar_left_m    = 99.0f;
+                g_lidar_right_m   = 99.0f;
             }
         }
     }
@@ -156,6 +186,11 @@ int main(void)
         uint32_t now = HAL_GetTick();
         if ((uint32_t)(now - last_nav) >= 50) {
             last_nav = now;
+            /* 检查ISR投递的目标 (防数据竞争) */
+            if (nav_target_pending) {
+                Nav_SetTarget(nav_pending_x, nav_pending_y);
+                nav_target_pending = 0;
+            }
             APP_Navigate_Update();
         }
     }
@@ -167,13 +202,22 @@ int main(void)
         uint32_t now = HAL_GetTick();
         if ((uint32_t)(now - last_diag) >= 2000) {
             last_diag = now;
-            printf("NAV: st=%d TO=%d dutL=%d dutR=%d odAvg=%.0f uwb=(%d,%d) spdL=%.0f spdR=%.0f yaw=%.0f err=%.2f cw=%.2f\r\n",
-                   nav_state, g_lidar_turn_open, g_duty_L, g_duty_R,
+            /* 清除 USART6 ORE: printf 发送期间若有字节到达不丢中断 */
+            __HAL_UART_CLEAR_OREFLAG(&huart6);
+            huart6.ErrorCode = HAL_UART_ERROR_NONE;
+            {
+                const UWB_State_t *u = UWB_GetState();
+                printf("UWB raw: x=%.2f y=%.2f q=%d valid=%d\r\n",
+                       u->x_m, u->y_m, u->quality, u->data_valid);
+            }
+            printf("NAV: st=%d TO=%d la=%d dutL=%d dutR=%d odAvg=%.0f uwb=(%d,%d) spdL=%.0f spdR=%.0f yaw=%.0f err=%.2f cw=%.2f lf=%.2f ll=%.2f lr=%.2f\r\n",
+                   nav_state, g_lidar_turn_open, g_lidar_assist_state, g_duty_L, g_duty_R,
                    (Encoder_GetLeftOdom_mm() + Encoder_GetRightOdom_mm()) * 0.5f,
                    (int)nav_pose.x_mm, (int)nav_pose.y_mm,
                    Encoder_GetLeftSpeed_mm_s(), Encoder_GetRightSpeed_mm_s(),
                    HLD_get_yaw_deg(),
-                   g_gyro_yaw_err, g_gyro_corr_w);
+                   g_gyro_yaw_err, g_gyro_corr_w,
+                   g_lidar_front_m, g_lidar_left_m, g_lidar_right_m);
         }
     }
 

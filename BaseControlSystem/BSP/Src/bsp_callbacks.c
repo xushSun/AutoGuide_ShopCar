@@ -7,19 +7,26 @@
 
 #include "Header.h"
 
+#define GYRO_SCALE  0.96f    /* MPU6050 yaw scale, tune by 90deg turn test */
+
 static uint8_t gyro_inited = 0;
 static float gyro_yaw_rad   = 0.0f;
 static float lock_yaw_rad   = 0.0f;
 static float lock_i          = 0.0f;
 static uint8_t lock_active   = 0;
 
-#define LOCK_KP  15.0f       /* 直行锁航向 (5→15 强力修偏)   */
-#define LOCK_KI  3.0f         /* 积分兜底 (1→3 快积)          */
-#define LOCK_IMAX  5.0f       /* 积分上限 (2→5)               */
+#define GYRO_STILL_SPEED_MM_S    8.0f
+#define GYRO_STILL_DUTY          20
+#define GYRO_STILL_HOLD_MS       300
+#define GYRO_BIAS_EMA_ALPHA      0.02f
+#define GYRO_STATIC_DEADBAND_DPS 0.08f
+
+#define LOCK_KP  800.0f      /* 直行锁航向 → 占空比修正       */
+#define LOCK_KI  20.0f        /* 积分兜底 → 占空比修正         */
+#define LOCK_IMAX  300.0f     /* 积分上限 → 占空比修正         */
 #define LOCK_DEADBAND 0.0017f /* 死区0.1° (0.5°→0.1° 严格)  */
 
 static float gyro_bias_dps = 0.0f;   /* Gz 零偏 °/s, 上电自动校准 */
-static uint8_t gyro_cal_done = 0;
 
 float g_gyro_yaw_err = 0.0f;         /* 当前航向误差 (rad), 诊断用 */
 float g_gyro_corr_w  = 0.0f;         /* 当前修正角速度 (rad/s), 诊断用 */
@@ -36,11 +43,38 @@ void GyroHold_Update(void)
 {
     if (!gyro_inited) return;
     static uint32_t last_ms = 0;
+    static uint32_t still_since_ms = 0;
     uint32_t now = HAL_GetTick();
     if (last_ms == 0) { last_ms = now; return; }
     float dt = (float)(now - last_ms) * 0.001f;
     last_ms = now;
-    gyro_yaw_rad += (gyro_data.Gz - gyro_bias_dps) * 0.0174533f * dt;
+
+    float abs_l = Encoder_GetLeftSpeed_mm_s();
+    float abs_r = Encoder_GetRightSpeed_mm_s();
+    if (abs_l < 0.0f) abs_l = -abs_l;
+    if (abs_r < 0.0f) abs_r = -abs_r;
+
+    int16_t duty_l = g_duty_L;
+    int16_t duty_r = g_duty_R;
+    if (duty_l < 0) duty_l = -duty_l;
+    if (duty_r < 0) duty_r = -duty_r;
+
+    if (abs_l < GYRO_STILL_SPEED_MM_S && abs_r < GYRO_STILL_SPEED_MM_S &&
+        duty_l < GYRO_STILL_DUTY && duty_r < GYRO_STILL_DUTY) {
+        if (still_since_ms == 0) still_since_ms = now;
+        if ((uint32_t)(now - still_since_ms) >= GYRO_STILL_HOLD_MS) {
+            gyro_bias_dps += GYRO_BIAS_EMA_ALPHA * (gyro_data.Gz - gyro_bias_dps);
+            g_gyro_yaw_err = 0.0f;
+            g_gyro_corr_w = 0.0f;
+            return;
+        }
+    } else {
+        still_since_ms = 0;
+    }
+
+    float gz_corrected = gyro_data.Gz - gyro_bias_dps;
+    if (gz_corrected > -GYRO_STATIC_DEADBAND_DPS && gz_corrected < GYRO_STATIC_DEADBAND_DPS) gz_corrected = 0.0f;
+    gyro_yaw_rad += gz_corrected * 0.0174533f * dt * GYRO_SCALE;
 }
 
 /*
@@ -63,7 +97,6 @@ void GyroHold_Calibrate(void)
 
     if (n > 50) {
         gyro_bias_dps = sum / (float)n;
-        gyro_cal_done = 1;
         printf("GYRO: bias=%.3f dps (%d samples)\r\n", gyro_bias_dps, (int)n);
     } else {
         gyro_bias_dps = 0.0f;
@@ -97,15 +130,16 @@ float GyroHold_ComputeW(void)
      * 攒够了自然抵消稳态偏航。
      */
     lock_i += yaw_err * dt;
-    if (lock_i >  LOCK_IMAX) lock_i =  LOCK_IMAX;
-    if (lock_i < -LOCK_IMAX) lock_i = -LOCK_IMAX;
+    float i_term = LOCK_KI * lock_i;
+    if (i_term >  LOCK_IMAX) i_term =  LOCK_IMAX;
+    if (i_term < -LOCK_IMAX) i_term = -LOCK_IMAX;
 
     /* 死区仅压 P 项 (防陀螺噪声抖舵), I 始终输出 (bias 抵消) */
     float p_term = LOCK_KP * yaw_err;
     if (yaw_err > -LOCK_DEADBAND && yaw_err < LOCK_DEADBAND) {
         p_term = 0.0f;
     }
-    g_gyro_corr_w = p_term + LOCK_KI * lock_i;
+    g_gyro_corr_w = p_term + i_term;
     return g_gyro_corr_w;
 }
 
@@ -159,6 +193,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART1) {
         extern uint8_t uwb_rx_byte;
         UWB_RxCallback(uwb_rx_byte);
+        __HAL_UART_CLEAR_OREFLAG(&huart1);
+        huart1.ErrorCode = HAL_UART_ERROR_NONE;
         HAL_UART_Receive_IT(&huart1, &uwb_rx_byte, 1);
     }
 #endif
@@ -166,6 +202,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART6) {
         extern uint8_t host_rx_byte;
         HostUART_ParseByte(host_rx_byte);
+        __HAL_UART_CLEAR_OREFLAG(&huart6);
+        huart6.ErrorCode = HAL_UART_ERROR_NONE;
         HAL_UART_Receive_IT(&huart6, &host_rx_byte, 1);
     }
 #endif
@@ -174,8 +212,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 void BSP_UART2_IDLE_Handler(void)
 {
 #if DEBUG_ENABLE_LIDAR
-    uint16_t len = LD06_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx);
-    if (len > 0) Lidar_ParseFrame(Lidar_GetDMABuf(), len);
+    Lidar_MarkDataPending();
 #else
     (void)huart2;
 #endif

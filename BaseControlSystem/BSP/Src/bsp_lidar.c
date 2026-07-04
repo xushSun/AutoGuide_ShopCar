@@ -24,6 +24,11 @@
 
 /* DMA 循环接收缓冲（4字节对齐，防DMA未对齐错误） */
 static uint8_t  dma_buf[LD06_DMA_BUF_LEN] __attribute__((aligned(4)));
+static uint16_t dma_read_pos;
+static volatile uint8_t dma_data_pending;
+static uint8_t  pkt_buf[64];
+static uint8_t  pkt_idx;
+static uint8_t  pkt_expected_len;
 
 /* 点云双缓冲（写Bank不被干扰，读Bank稳定） */
 static LidarPoint_t scan_buf[2][LD06_SCAN_POINTS_MAX];
@@ -94,11 +99,117 @@ void Lidar_Init(void)
     memset(scan_buf, 0, sizeof(scan_buf));
 
     active_bank   = 0;
+    dma_read_pos  = 0;
+    dma_data_pending = 0;
+    pkt_idx = 0;
+    pkt_expected_len = 0;
     scan_count[0] = 0;  scan_count[1] = 0;
     scan_ready[0] = 0;  scan_ready[1] = 0;
 
     __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);        /* 使能帧空闲中断 */
     HAL_UART_Receive_DMA(&huart2, dma_buf, LD06_DMA_BUF_LEN);  /* 启动DMA */
+}
+
+void Lidar_Poll(void)
+{
+    uint16_t write_pos = LD06_DMA_BUF_LEN - __HAL_DMA_GET_COUNTER(huart2.hdmarx);
+
+    if (!dma_data_pending && write_pos == dma_read_pos)
+        return;
+    dma_data_pending = 0;
+
+    if (write_pos == dma_read_pos)
+        return;
+
+    if (write_pos > dma_read_pos) {
+        Lidar_ParseFrame(&dma_buf[dma_read_pos], write_pos - dma_read_pos);
+    } else {
+        Lidar_ParseFrame(&dma_buf[dma_read_pos], LD06_DMA_BUF_LEN - dma_read_pos);
+        if (write_pos > 0)
+            Lidar_ParseFrame(dma_buf, write_pos);
+    }
+
+    dma_read_pos = write_pos;
+}
+
+void Lidar_MarkDataPending(void)
+{
+    dma_data_pending = 1;
+}
+
+static void lidar_parse_packet(const uint8_t *pkt, uint16_t pkt_len)
+{
+    uint16_t pkt_points = pkt[1] & 0x1F;
+
+    if (ld06_crc8(pkt, pkt_len - 1) != pkt[pkt_len - 1])
+        return;
+
+    uint16_t start_ang = u16_le(&pkt[4]);
+    uint16_t end_ang   = u16_le(&pkt[6 + (uint16_t)pkt_points * 3]);
+    uint16_t base = 6;
+
+    for (uint8_t n = 0; n < pkt_points; n++) {
+        uint16_t dist_raw  = u16_le(&pkt[base + n * 3]);
+        uint8_t  intensity = pkt[base + n * 3 + 2];
+
+        if (dist_raw == 0 || intensity == 0) continue;
+
+        float frac = (pkt_points > 1) ? ((float)n / (float)(pkt_points - 1)) : 0.0f;
+        int32_t delta_ang = (int32_t)end_ang - (int32_t)start_ang;
+        if (delta_ang < 0) delta_ang += 36000;
+        uint16_t pt_ang_raw = (uint16_t)(((int32_t)start_ang
+                               + (int32_t)((float)delta_ang * frac)) % 36000);
+
+        uint16_t idx = scan_count[active_bank];
+        if (idx >= LD06_SCAN_POINTS_MAX) continue;
+
+        polar_to_cart((float)dist_raw, pt_ang_raw, &scan_buf[active_bank][idx]);
+        scan_buf[active_bank][idx].intensity = intensity;
+        scan_buf[active_bank][idx].valid     = 1;
+        scan_count[active_bank] = idx + 1;
+    }
+
+    if (scan_count[active_bank] >= LD06_SCAN_POINTS_MAX / 2) {
+        scan_ready[active_bank] = 1;
+        active_bank ^= 1;
+        scan_count[active_bank] = 0;
+        scan_ready[active_bank] = 0;
+    }
+}
+
+static void lidar_parse_byte(uint8_t b)
+{
+    if (pkt_idx == 0) {
+        if (b == LD06_HEADER) {
+            pkt_buf[pkt_idx++] = b;
+            pkt_expected_len = 0;
+        }
+        return;
+    }
+
+    pkt_buf[pkt_idx++] = b;
+
+    if (pkt_idx == 2) {
+        uint8_t pkt_type = (b >> 5) & 0x07;
+        uint8_t pkt_points = b & 0x1F;
+        if (pkt_type != 1 || pkt_points == 0 || pkt_points > LD06_PKT_POINTS_MAX) {
+            pkt_idx = 0;
+            pkt_expected_len = 0;
+            return;
+        }
+        pkt_expected_len = 2 + 2 + 2 + pkt_points * 3 + 2 + 2 + 1;
+        if (pkt_expected_len > sizeof(pkt_buf)) {
+            pkt_idx = 0;
+            pkt_expected_len = 0;
+            return;
+        }
+    }
+
+    if (pkt_expected_len > 0 && pkt_idx >= pkt_expected_len) {
+        lidar_parse_packet(pkt_buf, pkt_expected_len);
+        pkt_idx = 0;
+        pkt_expected_len = 0;
+    }
 }
 
 /**
@@ -108,64 +219,8 @@ void Lidar_Init(void)
  */
 void Lidar_ParseFrame(const uint8_t *buf, uint16_t len)
 {
-    uint16_t i = 0;
-    uint16_t pkt_points;            /* N = VerLen & 0x1F                     */
-
-    while (i + 1 < len) {
-
-        /* — 搜索0x54帧头 — */
-        if (buf[i] != LD06_HEADER) { i++; continue; }
-        if (i + 8 > len) break;                        /* 不够最小子帧长度 */
-
-        uint8_t verlen   = buf[i + 1];
-        uint8_t pkt_type = (verlen >> 5) & 0x07;       /* bit[7:5]—1=点云 */
-        pkt_points = verlen & 0x1F;                    /* bit[4:0]—N≤12   */
-        if (pkt_type != 1) { i++; continue; }           /* 只处理点云帧   */
-
-        uint16_t pkt_len = 2 + 2 + 2 + (uint16_t)pkt_points * 3 + 2 + 2 + 1;
-        if (i + pkt_len > len) break;
-
-        /* — CRC校验（不含CRC字节本身） — */
-        uint8_t crc_calc = ld06_crc8(&buf[i], pkt_len - 1);
-        uint8_t crc_rcvd = buf[i + pkt_len - 1];
-        if (crc_calc != crc_rcvd) { i++; continue; }    /* 校验失败，跳过1字节重搜 */
-
-        /* — 提取角度起止 — */
-        uint16_t start_ang = u16_le(&buf[i + 4]);
-        uint16_t end_ang   = u16_le(&buf[i + 6 + (uint16_t)pkt_points * 3]);
-
-        /* — 解析N个点 — */
-        uint16_t base = i + 6;                   /* 第一个点的数据字节偏移 */
-        for (uint8_t n = 0; n < pkt_points; n++) {
-            uint16_t dist_raw  = u16_le(&buf[base + n * 3]);
-            uint8_t  intensity = buf[base + n * 3 + 2];
-
-            if (dist_raw == 0 || intensity == 0) continue;   /* 无效点 */
-
-            /* 角度线性插值（子帧起止角之间） */
-            float frac = (pkt_points > 1) ? ((float)n / (float)(pkt_points - 1)) : 0.0f;
-            uint16_t pt_ang_raw = (uint16_t)((float)start_ang
-                                   + (float)((int16_t)(end_ang - start_ang)) * frac);
-
-            uint16_t idx = scan_count[active_bank];
-            if (idx >= LD06_SCAN_POINTS_MAX) continue;       /* Bank满，丢弃 */
-
-            polar_to_cart((float)dist_raw, pt_ang_raw, &scan_buf[active_bank][idx]);
-            scan_buf[active_bank][idx].intensity = intensity;
-            scan_buf[active_bank][idx].valid     = 1;
-            scan_count[active_bank] = idx + 1;
-        }
-
-        i += pkt_len;                                      /* 跳到下一个子帧 */
-    }
-
-    /* — 翻转检测：当前Bank点数过半即视为一圈，交换双缓冲 — */
-    if (scan_count[active_bank] >= LD06_SCAN_POINTS_MAX / 2) {
-        scan_ready[active_bank] = 1;
-        active_bank ^= 1;                                  /* 切换写入Bank */
-        scan_count[active_bank] = 0;
-        scan_ready[active_bank] = 0;
-    }
+    for (uint16_t k = 0; k < len; k++)
+        lidar_parse_byte(buf[k]);
 }
 
 /* 获取最新一帧点云（读取非活跃Bank，消费 ready 标志） */

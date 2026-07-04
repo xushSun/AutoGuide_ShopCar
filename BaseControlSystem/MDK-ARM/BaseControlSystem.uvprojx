@@ -410,11 +410,6 @@
               <FilePath>..\APP\Src\app_navigate.c</FilePath>
             </File>
             <File>
-              <FileName>navi_task.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\APP\Src\navi_task.c</FilePath>
-            </File>
-            <File>
               <FileName>coord_solver.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\APP\Src\coord_solver.c</FilePath>

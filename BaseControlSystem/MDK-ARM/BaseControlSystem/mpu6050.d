@@ -1,5 +1,6 @@
 basecontrolsystem\mpu6050.o: ..\BSP\Src\mpu6050.c
 basecontrolsystem\mpu6050.o: G:\MicrosoftEogeDownload\Keil5-MDK\ARM\ARMCOMPLIER506\Bin\..\include\math.h
+basecontrolsystem\mpu6050.o: G:\MicrosoftEogeDownload\Keil5-MDK\ARM\ARMCOMPLIER506\Bin\..\include\stdio.h
 basecontrolsystem\mpu6050.o: ../BSP/inc/mpu6050.h
 basecontrolsystem\mpu6050.o: G:\MicrosoftEogeDownload\Keil5-MDK\ARM\ARMCOMPLIER506\Bin\..\include\stdint.h
 basecontrolsystem\mpu6050.o: ../Core/Inc/i2c.h

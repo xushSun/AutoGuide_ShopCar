@@ -27,9 +27,7 @@ uint8_t              host_rx_byte;
 static char   text_line[32];
 static uint8_t text_idx;
 static uint8_t text_need_y;  /* 1=已收到x, 等y */
-volatile uint8_t text_ready;
-volatile int     text_tx, text_ty;
-volatile uint32_t text_last_ms;  /* 最后一次按键时刻 */
+static uint32_t text_last_ms;  /* 最后一次按键时刻 */
 
 static void host_dispatch(uint8_t cmd, const uint8_t *payload, uint8_t len)
 {
@@ -43,7 +41,10 @@ static void host_dispatch(uint8_t cmd, const uint8_t *payload, uint8_t len)
 
             /* 三传感器导航: 目标坐标 → 状态机自动规划路线 */
 #if DEBUG_ENABLE_NAVI
-            Nav_SetTarget(x, y);
+            /* ISR上下文: 只设标志位, 主循环安全调用 Nav_SetTarget */
+            nav_pending_x = x;
+            nav_pending_y = y;
+            nav_target_pending = 1;
 #else
             uint8_t wp_cnt = Path_Plan(0, 0, x, y);
             if (wp_cnt > 0) {
@@ -91,9 +92,9 @@ static void host_dispatch(uint8_t cmd, const uint8_t *payload, uint8_t len)
             int16_t by = (int16_t)(payload[6] | ((uint16_t)payload[7] << 8));
             /* C锚世界坐标固定, UWB实测值固定 */
             CoordSolver_SetAnchors(ax, ay, bx, by, 9660, 8930,
-                                   8.85f, 0.00f,
-                                   -0.72f, 1.00f,
-                                   8.95f, 9.35f);
+                                   8.93f, 0.17f,
+                                   -0.83f, 0.00f,
+                                   9.39f, 9.05f);
         }
         break;
 #endif
@@ -115,10 +116,6 @@ static void parse_delay_cmd(void)
 
     /* ? / h → 帮助 */
     if (cmd == '?' || cmd == 'h' || cmd == 'H') {
-        extern float uwb_delay_a_m, uwb_delay_b_m, uwb_delay_c_m;
-        printf("\r\n=== DELAY ===\r\n");
-        printf("A=%.2f  B=%.2f  C=%.2f\r\n", uwb_delay_a_m, uwb_delay_b_m, uwb_delay_c_m);
-        printf("Usage: A0.5  B1.2  C0.3\r\n");
         text_idx = 0;
         return;
     }
@@ -134,9 +131,11 @@ static void parse_delay_cmd(void)
     /* 解析 float: 整数 + 可选小数 */
     float vf = 0.0f;
     uint8_t j = 1;  /* 跳过首字母 */
+    uint8_t neg = 0;
     float frac = 0.1f;
     uint8_t in_frac = 0;
 
+    if (text_line[j] == '-') { neg = 1; j++; }
     for (; text_line[j]; j++) {
         if (text_line[j] == '.') { in_frac = 1; continue; }
         if (text_line[j] < '0' || text_line[j] > '9') break;
@@ -144,57 +143,46 @@ static void parse_delay_cmd(void)
         else         { vf = vf * 10.0f + (float)(text_line[j]-'0'); }
     }
 
+    if (neg) vf = -vf;
     UWB_SetDelay(cmd, vf);
-    printf("OK %c=%.2f\r\n", (cmd>='a'&&cmd<='c')?cmd-32:cmd, vf);
     text_idx = 0;
 }
 
-/* ── ASCII解析 (独立函数) ── */
+/* ── ASCII解析 (独立函数, 仅业务逻辑不阻塞) ── */
 static void parse_ascii_number(void)
 {
-    if (text_idx == 0) return;
+    if (text_idx == 0) {
+        /* 空分隔符: 如果正在等Y, 超时重置 */
+        if (text_need_y) text_need_y = 0;
+        return;
+    }
     text_line[text_idx] = '\0';
+
+    /* 只解析数字和负号 */
     uint8_t j = 0, neg = 0;
     if (text_line[0] == '-') { neg = 1; j = 1; }
-    int v = 0;
-    for (; text_line[j]; j++) v = v*10 + text_line[j] - '0';
+    if (j >= text_idx) { text_idx = 0; return; }  /* 只有'-'无数字 */
+    int32_t v = 0;
+    for (; j < text_idx; j++) {
+        if (text_line[j] < '0' || text_line[j] > '9') break;
+        v = v * 10 + (text_line[j] - '0');
+    }
     if (neg) v = -v;
 
-    if (text_need_y) {
-        text_ty = v;
-        text_need_y = 0;
-        text_ready = 1;
-        /* ISR内直接发路点 (纯寄存器, 无sprintf/无HAL) */
-        #define T(c) do{while(!(USART6->SR&USART_SR_TXE));USART6->DR=(c);}while(0)
-        #define W(s) do{const char *p_=(s);while(*p_)T(*p_++);}while(0)
-        #define WI(vv) do{ \
-            int vv_=(vv);uint8_t t_,d_[8],n_=0;if(vv_<0){T('-');vv_=-vv_;} \
-            do{d_[n_++]='0'+vv_%10;vv_/=10;}while(vv_); \
-            for(t_=n_;t_>0;)T(d_[--t_]);}while(0)
-        const UWB_State_t *u = UWB_GetState();
-        int32_t swx, swy;
-#if DEBUG_ENABLE_UWB && DEBUG_ENABLE_COORD_SOLVER
-        CoordSolver_Transform(u->x_m, u->y_m, &swx, &swy);
-#else
-        /* 纯路径规划模式: 假设起点(0,0) */
-        (void)u; swx = 0; swy = 0;
-#endif
-        uint8_t wc = Path_Plan(swx, swy, text_tx*1000, text_ty*1000);
-        W("\r\nfrom "); WI((int)swx); T(','); WI((int)swy);
-        W(" to "); WI(text_tx*1000); T(','); WI(text_ty*1000);
-        W("mm  WPs="); WI(wc); W("\r\n");
-        const PpWaypoint_t *wp = Path_GetWPs(); uint8_t wi;
-        for (wi=0; wi<wc; wi++) {
-            T(' '); WI((int)(wp[wi].x_mm)); T(','); WI((int)(wp[wi].y_mm)); W("\r\n");
-        }
-        #undef WI
-        #undef W
-        #undef T
+    /* 范围检查 */
+    if (v < 0 || v > 50000) {
+        text_idx = 0; text_need_y = 0;
+        return;
+    }
 
-        /* 触发导航 (ASCII模式: 输入单位米, 转mm) */
-        Nav_SetTarget(text_tx * 1000, text_ty * 1000);
+    if (text_need_y) {
+        /* Y坐标 → 触发目标 */
+        nav_pending_y = v * 1000;
+        nav_target_pending = 1;
+        text_need_y = 0;
     } else {
-        text_tx = v;
+        /* X坐标 */
+        nav_pending_x = v * 1000;
         text_need_y = 1;
     }
     text_idx = 0;
@@ -203,7 +191,8 @@ static void parse_ascii_number(void)
 void HostUART_Init(void)
 {
     rx_state = HOST_STATE_IDLE;
-    rx_idx = 0; text_idx = 0; text_need_y = 0; text_ready = 0; text_last_ms = 0;
+    rx_idx = 0; text_idx = 0; text_need_y = 0; text_last_ms = 0;
+    nav_pending_x = 0; nav_pending_y = 0; nav_target_pending = 0;
     memset(rx_buf, 0, sizeof(rx_buf));
     memset(text_line, 0, sizeof(text_line));
     HAL_UART_Receive_IT(&huart6, &host_rx_byte, 1);
@@ -214,7 +203,16 @@ void HostUART_ParseByte(uint8_t byte)
     /* 空闲态 + 非帧头 → ASCII；正在收二进制帧时不干扰 */
     if (rx_state == HOST_STATE_IDLE && byte != HOST_HEADER) {
         text_last_ms = HAL_GetTick();
-        if (byte == ' ' || byte == '\r' || byte == '\n') {
+        /* 仅数字和负号存入text_line; 其他字符均视为分隔符触发解析 */
+        if ((byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
+            byte == 'A' || byte == 'B' || byte == 'C' ||
+            byte == 'a' || byte == 'b' || byte == 'c' ||
+            byte == '?' || byte == 'h' || byte == 'H') {
+            if (text_idx < 31) {
+                text_line[text_idx++] = (char)byte;
+            }
+        } else {
+            /* 分隔符: 先判断是否是调参指令, 否则解析数字 */
             if (text_idx > 0) {
                 char c0 = text_line[0];
                 if (c0 == 'A' || c0 == 'B' || c0 == 'C' ||
@@ -223,11 +221,9 @@ void HostUART_ParseByte(uint8_t byte)
                     parse_delay_cmd();
                 else
                     parse_ascii_number();
-            }
-        } else {
-            if (text_idx < 31) {
-                text_line[text_idx++] = (char)byte;
-                if (text_need_y && text_idx > 0) parse_ascii_number();
+            } else {
+                /* 连续分隔符: 重置Y等待状态 */
+                if (text_need_y) text_need_y = 0;
             }
         }
         rx_state = HOST_STATE_IDLE;
@@ -261,9 +257,13 @@ void HostUART_ParseByte(uint8_t byte)
 
 void HostUART_CheckTimeout(void)
 {
-    if (text_need_y && text_idx > 0 &&
-        ((uint32_t)(HAL_GetTick() - text_last_ms)) > 500) {
-        parse_ascii_number();
+    if (text_need_y) {
+        uint32_t dt = (uint32_t)(HAL_GetTick() - text_last_ms);
+        if (text_idx > 0 && dt > 500) {
+            parse_ascii_number();
+        } else if (text_idx == 0 && dt > 500) {
+            text_need_y = 0;  /* 超时没收到Y, 重置状态机 */
+        }
     }
 }
 

@@ -282,20 +282,6 @@ void UWB_Poll(void)
     uwb_state.anchor_B.dist_m = uB ? eb : 0; uwb_state.anchor_B.rssi = rssiB; uwb_state.anchor_B.last_update_ms = msB;
     uwb_state.anchor_C.dist_m = uC ? ec : 0; uwb_state.anchor_C.rssi = rssiC; uwb_state.anchor_C.last_update_ms = msC;
 
-    /* ── 每1s printf ── */
-    {
-        static uint32_t lt = 0;
-        if ((uint32_t)(now - lt) >= 1000) {
-            lt = now;
-            printf("X=%.2f Y=%.2f eA=%.2f eB=%.2f eC=%.2f Q=%d A=%c B=%c C=%c R=%.3f d=%.2f/%.2f/%.2f\r\n",
-                   uwb_state.x_m, uwb_state.y_m,
-                   ea, eb, ec,
-                   uwb_state.quality,
-                   uA ? 'V' : '.', uB ? 'V' : '.', uC ? 'V' : '.',
-                   uwb_state.rmse_m,
-                   uwb_delay_a_m, uwb_delay_b_m, uwb_delay_c_m);
-        }
-    }
 }
 
 const UWB_State_t * UWB_GetState(void) { return &uwb_state; }

@@ -52,6 +52,38 @@ static const int32_t col_x[COLS] = { 600, 1110, 2220, 3330, 4440, 5550, 6660, 88
 /* 垂直通道: 仅主过道 col8=9270 可南北穿行，货架列间无缝隙 */
 static const uint8_t col_vertical[COLS] = { 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
+static uint8_t lane_of_y(int32_t y)
+{
+    if (y >= 0 && y <= 1900) return 1;
+    if (y >= 3360 && y <= 5050) return 2;
+    if (y >= 6510 && y <= 8200) return 3;
+    return 0;
+}
+
+static uint8_t try_direct_path(int32_t sx, int32_t sy, int32_t gx, int32_t gy)
+{
+    uint8_t sl = lane_of_y(sy);
+    uint8_t gl = lane_of_y(gy);
+
+    if (sl != 0 && sl == gl) {
+        waypoints[0].x_mm = gx;
+        waypoints[0].y_mm = gy;
+        wp_count = 1;
+        wp_index = 0;
+        return 1;
+    }
+
+    if (sx >= 8500 && gx >= 8500) {
+        waypoints[0].x_mm = gx;
+        waypoints[0].y_mm = gy;
+        wp_count = 1;
+        wp_index = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
 static void add_edge(uint8_t a, uint8_t b, uint16_t cost)
 {
     if (nodes[a].n_edges < 8) {
@@ -136,6 +168,10 @@ uint8_t Path_Plan(int32_t sx, int32_t sy, int32_t gx, int32_t gy)
     if (node_count == 0) return 0;
 
     uint8_t i;
+
+    if (try_direct_path(sx, sy, gx, gy)) {
+        return wp_count;
+    }
 
     /* ── 找最近路点 ── */
     {

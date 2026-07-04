@@ -34,6 +34,5 @@ basecontrolsystem\coord_solver.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_
 basecontrolsystem\coord_solver.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim.h
 basecontrolsystem\coord_solver.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h
 basecontrolsystem\coord_solver.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h
-basecontrolsystem\coord_solver.o: ../BSP/inc/bsp_uwb.h
 basecontrolsystem\coord_solver.o: G:\MicrosoftEogeDownload\Keil5-MDK\ARM\ARMCOMPLIER506\Bin\..\include\math.h
 basecontrolsystem\coord_solver.o: G:\MicrosoftEogeDownload\Keil5-MDK\ARM\ARMCOMPLIER506\Bin\..\include\string.h

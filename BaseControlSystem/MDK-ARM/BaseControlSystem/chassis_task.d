@@ -38,3 +38,4 @@ basecontrolsystem\chassis_task.o: ../APP/inc/kinematics.h
 basecontrolsystem\chassis_task.o: ../APP/inc/pid.h
 basecontrolsystem\chassis_task.o: ../BSP/inc/bsp_motor.h
 basecontrolsystem\chassis_task.o: ../BSP/inc/bsp_encoder.h
+basecontrolsystem\chassis_task.o: ../BSP/inc/bsp_callbacks.h

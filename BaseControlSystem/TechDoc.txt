@@ -175,35 +175,36 @@
 
 
 
-九、导航控制策略
+九、导航控制策略 (2026-07-01 重构)
 --------------------------------
 
-  输入: Navi_SetTarget(x, y) 设目标坐标
-  当前位姿来源:
-    主: UWB实时定位提供(x,y)绝对坐标, 无累积漂移
-    **yaw: MPU6050陀螺仪 Gz积分** (不依赖编码器差速)
-        兜底: UWB掉线时编码器短期接管(x,y)位置推算
+  5状态机: IDLE → PLAN → ALIGN → DRIVE → (回ALIGN) → ARRIVED
 
-  控制律 (P控制, 每10ms):
-    1. dx = 目标x - 当前x
-    2. dy = 目标y - 当前y
-    3. 距离 dist = sqrt(dx^2 + dy^2)
-    4. 目标朝向 desired_yaw = atan2(dy, dx)
-    5. 角度误差 err = norm(desired_yaw - 当前yaw)  范围(-PI,PI)
-    6. v = NAVI_K_DIST * dist,  限幅到 MAX_SPEED
-    7. w = NAVI_K_ANGLE * err,  限幅到 MAX_OMEGA
-    8. 大角度偏差(>57度)时 v *= 0.3 (先转后走)
-    9. Chassis_SetTarget(v, w)
-    10. dist < 500mm 判定到达, 自动停车
+  IDLE:    等待上位机 CMD 0x01 发来目标坐标, PID关, 车不动
+  PLAN:    调用 Path_Plan(当前x,当前y,目标x,目标y) A*规划
+           UWB无效时起点用(0,0)。有路点→ALIGN, 无路→ARRIVED
+  ALIGN:   原地转弯, v=0纯w。target_yaw = atan2f(dy,dx)
+           转弯前 HoldYaw_Release 解除锁航向
+           w = sign(err) × 0.6 rad/s, |err|<0.3时减速到25%
+           |err|<0.05rad(2.9°)→完成进DRIVE。UWB丢包时保持上次target_yaw
+  DRIVE:   直行, 进入时 Encoder_ResetOdom + HoldYaw_Lock 锁航向
+           v=200mm/s, w=GyroHold_ComputeW(), 接近目标<800mm线性减速
+           到达: 编码器里程≥80%后UWB距离<400mm→到达; 编码器≥120%强制到达
+           到达后: 还有路点→回ALIGN, 最后路点→ARRIVED
+  ARRIVED: 刹车 Chassis_SetTarget(0,0), PID关, nav_arrived=1
 
-  可调参数:
-    NAVI_ARRIVE_MM        = 500   到达判定距离(mm) — 格级导航容差
-    NAVI_MAX_SPEED_MM_S   = 300   最大线速度(mm/s)
-    NAVI_MAX_OMEGA        = 0.6   最大角速度(rad/s) — 防UWB噪声放大
-    NAVI_K_DIST           = 0.5   距离->速度 P系数 — 略增克服起步停滞
-    NAVI_K_ANGLE          = 0.6   角度差->角速度 P系数 — 降低防摆动
-    NAVI_ANGLE_EMA_ALPHA  = 0.15  角度误差EMA α — 滤除UWB跳变
-    NAVI_SLOW_ANGLE_THRESH= 1.5   超过86°才减速 (防UWB噪声频繁误触发)
+  UWB滤波 (nav_UpdatePose):
+    - 跳变检测: 新坐标与EMA值差>400mm→丢弃
+    - EMA平滑: alpha=0.3
+    - 丢包超时: 1500ms (bsp_uwb内部3s旧值保存覆盖)
+
+  陀螺仪锁航向 (GyroHold_ComputeW):
+    - KP=15.0, KI=3.0, IMAX=5.0
+    - 死区0.1°仅压P项, I项始终累加不gate
+    - 真实dt用HAL_GetTick()实测, 替代硬编码0.05s
+    - 上电 GyroHold_Calibrate 静止2s自动校准 Gz 零偏
+    - Nav_SetTarget 时 GyroYaw_Reset 归零对齐世界坐标系
+    - ISR数据竞争已修复: GyroHold_Update 移出TIM4, 放main.c紧随ReadIMU
 
 
 十、底盘控制策略
@@ -263,8 +264,8 @@
     世界系:     A(8880,0)  B(0,0)    C(9660,8930)
     物理模块:   A=0x0002   B=0x0001  C=0x0003
 
-  高度 (06-28实测修正):
-    标签=0.52m  锚点=1.90m (三锚等高) → dz=1.38m
+  高度 (2026-07-01 终态):
+    标签=0.86m  锚点=1.90m (三锚等高) → dz=1.04m
 
   天线延迟 (运行时变量, USART6串口实时可调):
     A = 0.50m   B = 1.40m   C = 0.00m
@@ -285,18 +286,23 @@
     ? 回车   → 查看当前延迟值
 
 
-十二B、坐标解算器 (2026-06-20, B原点)
+十二B、坐标解算器 (2026-07-01 升级: 3锚6参数仿射)
 --------------------------------
 
-  目标: UWB局部坐标 → 超市世界坐标 (B=(0,0), +X=西, +Y=北)
+  目标: UWB局部坐标系 → 超市世界坐标系
 
-  变换步骤:
-    1. 计算AB连线在世界系中的方向角 θ = atan2(By-Ay, Bx-Ax)
-    2. 旋转: X' = xL·cosθ - yL·sinθ,  Y' = xL·sinθ + yL·cosθ
-    3. 平移: Xw = Ax + X',  Yw = Ay + Y'
+  原方案 (06-28): 2锚点2参数 AB单方向仿射
+  新方案 (07-01): 3锚点6参数仿射 W = M * U + T
 
-  锚点世界坐标: 由上位机CMD 0x05下发 (int16×4, mm)
-  UWB局部间距: UWB_ANCHOR_SPACING_M = 8.88m (用户实测)
+  实现: mat3_inverse() 3x3矩阵求逆
+    方程: M * [a,b,c]^T = [Wx_A, Wx_B, Wx_C]^T
+    解得: W_x = ax*U_x + bx*U_y + cx
+          W_y = ay*U_x + by*U_y + cy
+
+  标定数据 (app_init.c 硬编码):
+    世界: A(8880,0)  B(20,0)  C(9660,8930) mm
+    UWB:  A(8.85,0.00)  B(-0.72,1.00)  C(8.95,9.35) m
+    (UWB实测坐标已含旋转/平移, 6参数全自动求解)
 
 
 十二C、超市地图 (2026-06-20, 改 06-26)
@@ -459,3 +465,165 @@ CubeMX文件: BaseControlSystem.ioc
 Keil工程:   MDK-ARM\BaseControlSystem.uvprojx
 详细说明:   README.txt (函数+文件清单)
 技术文档:   本文档
+
+
+十五、2026-07-04 最终联调版说明
+--------------------------------
+
+1. 总体导航架构
+   当前实际使用的导航入口是 APP/Src/app_navigate.c，旧 navi_task.c 只保留为历史参考。
+   状态机流程为:
+     IDLE -> PLAN -> ALIGN -> DRIVE -> (ALIGN/DRIVE循环) -> ARRIVED
+
+   各传感器分工:
+     UWB: 用于粗定位、最终目标到达判定、串口诊断。UWB 精度有限，不再作为连续闭环主控制量。
+     编码器: DRIVE 阶段的主距离来源，按规划路段长度控制直行距离。
+     MPU6050 yaw: ALIGN 原地转向和 DRIVE 航向锁定的主角度来源。
+     LD06 雷达: 只作为辅助避障，不接管主导航。
+
+   当前地图默认起点逻辑坐标约为 (1000, 950) mm，开局默认朝 +X 方向。
+   后续连续导航时不会强制重置朝向，系统会保留 nav_heading，并按上一次最终逻辑位置继续规划。
+
+2. 路径和到达判定
+   Path_Plan 生成路点序列后，导航将每一段拆成“先转向、再直行”。
+   DRIVE 阶段主要按编码器里程判断路段是否走完，避免 UWB 抖动导致中途乱转。
+   最终目标点使用 UWB 做兜底到达判定:
+     NAV_FINAL_ARRIVE_MM = 350.0f
+
+   也就是说，最终停车点与目标点的允许误差目标为 0.35 m 以内。
+   路点到达容差 NAV_UWB_ARRIVE_MM 只影响中间路点辅助判断，不等同于最终停车精度。
+
+3. 连续导航和返程
+   Nav_SetTarget(x, y) 可以在 IDLE 或 ARRIVED 后再次调用。
+   新目标到来时:
+     不再默认 GyroYaw_Reset 到 +X。
+     nav_heading 保留上一次结束时的逻辑朝向。
+     logic_x_mm / logic_y_mm 使用上一次到达的目标点或已完成路点更新。
+
+   因此小车可以先从起点去目标点，再从目标点返回起点或去下一个目标点。
+   如果目标点到达后 UWB 漂移较大，逻辑位置仍以目标点为准，避免返程从错误的 UWB 点重新规划。
+
+4. 转弯逻辑
+   ALIGN 阶段用 MPU6050 yaw 控制原地旋转。
+   当前完成阈值:
+     NAV_ALIGN_DONE_RAD = 0.087f   约 5 度
+     NAV_ALIGN_SLOW_RAD = 0.30f    约 17 度，进入减速转弯
+
+   90 度转弯是标准动作。
+   180 度转弯不直接一次转完，而是拆成两次标准 90 度，原因是实车上 180 度一次转容易稳定少转约 45 度。
+   正常日志应类似:
+     TURN: h=0->1 dyaw=-90 split=1 final=2
+     TURN: h=1->2 dyaw=-90 split=2 final=2
+
+   如果只出现第一条 split=1 而没有 split=2，需要检查第二次转向前 PID 是否重新使能。
+   当前代码在两段 90 度之间会重新 Chassis_PID_Enable(1)，并释放 HoldYaw，防止急停后 PID 未恢复。
+
+5. DRIVE 航向锁定
+   DRIVE 阶段直行速度基准:
+     NAV_SPEED_MM_S = 200.0f
+
+   接近路段终点会按 NAV_SLOW_DIST_MM 逐步减速，最低不低于 NAV_MIN_SPEED_RATIO。
+   直行时调用 HoldYaw_Lock / HoldYaw_CorrectW，用 yaw 误差修正左右轮差速。
+   诊断日志中的:
+     yaw: 当前积分 yaw 角度，单位度
+     err: 航向锁定误差，单位 rad
+     cw: 航向修正角速度，单位 rad/s
+
+6. 雷达辅助避障
+   LD06 雷达只在 DRIVE 阶段辅助，不改变主路径规划。
+   main.c 从雷达点云中提取三个方向距离:
+     lf = g_lidar_front_m  前方障碍距离
+     ll = g_lidar_left_m   左侧障碍距离
+     lr = g_lidar_right_m  右侧障碍距离
+
+   当前检测窗口:
+     前方: x 0.15~0.90 m, y -0.30~0.30 m
+     左侧: x 0.12~0.70 m, y  0.18~0.42 m
+     右侧: x 0.12~0.70 m, y -0.42~-0.18 m
+
+   当前主要参数:
+     NAV_LIDAR_FRONT_STOP_M = 0.42f
+     NAV_LIDAR_FRONT_SLOW_M = 0.70f
+     NAV_LIDAR_SIDE_BLOCK_M = 0.36f
+     NAV_LIDAR_SIDE_CLEAR_M = 0.55f
+     NAV_LIDAR_SIDE_HOLD_MS = 650
+     NAV_LIDAR_ASSIST_W = 0.28f
+     NAV_LIDAR_RAMP_V_STEP = 35.0f
+     NAV_LIDAR_RAMP_W_STEP = 0.06f
+
+   避障策略:
+     左侧有障碍、右侧较空: 向右微调。
+     右侧有障碍、左侧较空: 向左微调。
+     只有正前方堵住: 低速转出 -> 低速绕过 -> 反向恢复航向 -> 回到原导航。
+
+   la 诊断值:
+     0 = 无避障
+     1 = 前方减速
+     2 = 正前方转出
+     3 = 绕障低速前进
+     4 = 恢复航向
+     5 = 单侧避障保持
+
+   雷达帧超时 NAV_LIDAR_TIMEOUT_MS 后，lf/ll/lr 会恢复 99.00，表示当前没有可靠障碍数据。
+
+7. 陀螺仪零漂处理
+   MPU6050 上电后先校准 gyro_bias_dps。
+   GyroHold_Update 中增加了静止检测:
+     左右编码器速度 < 8 mm/s
+     左右电机 duty < 20
+     持续静止 > 300 ms
+
+   满足静止条件时暂停 yaw 积分，并用 EMA 缓慢更新 gyro_bias_dps:
+     GYRO_BIAS_EMA_ALPHA = 0.02f
+     GYRO_STATIC_DEADBAND_DPS = 0.08f
+
+   这样可以抑制停车时 yaw 仍持续漂移的问题。
+
+8. 常用串口日志含义
+   目标输入示例:
+     9,4
+
+   规划日志:
+     NAV: plan ok, start=(1000,950), 5 segs, 1st=115mm
+     SEG: 115 8160 3245 470 305
+
+   转弯日志:
+     TURN: h=0->1 dyaw=-90 split=0 final=1
+
+   主导航日志:
+     NAV: st=3 TO=0 la=0 dutL=... dutR=... odAvg=... uwb=(x,y) spdL=... spdR=... yaw=... err=... cw=... lf=... ll=... lr=...
+
+   字段说明:
+     st: 导航状态，0 IDLE，1 PLAN，2 ALIGN，3 DRIVE，4 ARRIVED
+     TO: 右前方绕行窗口是否可转出
+     la: 雷达辅助避障状态
+     dutL/dutR: 左右电机输出 duty
+     odAvg: 左右编码器平均里程
+     uwb: 当前滤波后的 UWB 坐标，单位 mm
+     spdL/spdR: 左右轮编码器速度，单位 mm/s
+     yaw: 当前 yaw 积分角度，单位度
+     err/cw: 航向锁定误差和修正量
+     lf/ll/lr: 前、左、右障碍距离，单位 m，99.00 表示无有效障碍
+
+9. 实车测试建议
+   单目标直线测试:
+     起点约 (1000, 1000)，朝 +X，发送 9,1，确认能到主过道附近并停车。
+
+   转弯测试:
+     发送 9,4，观察第二段到主过道后是否出现 TURN 日志，并确认 yaw 接近 -90 度。
+
+   连续返程测试:
+     到达 9,4 后，再发送 1,1 或 9,1，确认不会按开局 +X 重置朝向，而是从当前 nav_heading 继续规划。
+
+   避障测试:
+     DRIVE 阶段在左侧放障碍，应观察 la=5 且车向右偏。
+     DRIVE 阶段在右侧放障碍，应观察 la=5 且车向左偏。
+     正前方放障碍，应观察 la 从 1/2/3/4 变化，绕开后恢复直行。
+
+10. Keil 编译注意
+   Keil 偶发出现:
+     L6449E: I/O error writing file '*.o': Invalid argument
+
+   该错误通常是 Keil/Windows 文件写入或对象文件占用问题，不一定是代码错误。
+   如果没有 C 编译错误，建议先关闭串口/调试占用后重新 Build 或 Rebuild。
+   真正需要优先处理的是 .c/.h 中的 error 行，而不是单独的 L6449E 写文件错误。
